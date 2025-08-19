@@ -435,7 +435,13 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
             )
 
         imdsv2_session_token = self._get_imdsv2_session_token(request)
-        role_name = self._get_metadata_role_name(request, imdsv2_session_token)
+        is_fargate = self._is_fargate_environment()
+
+        # In Fargate, we don't need to retrieve the role name as the metadata
+        # endpoint doesn't include role names in the URL structure
+        role_name = None
+        if not is_fargate:
+            role_name = self._get_metadata_role_name(request, imdsv2_session_token)
 
         # Get security credentials.
         credentials = self._get_metadata_security_credentials(
@@ -519,7 +525,7 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
                 HTTP requests.
             role_name (str): The AWS role name required by the AWS metadata
                 server security_credentials endpoint in order to return the
-                credentials.
+                credentials. Not used in Fargate environments.
             imdsv2_session_token (str): The AWS IMDSv2 session token to be added as a
                 header in the requests to AWS metadata endpoint.
 
@@ -535,8 +541,18 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
         if imdsv2_session_token is not None:
             headers["X-aws-ec2-metadata-token"] = imdsv2_session_token
 
+        # Detect Fargate environment to determine URL structure
+        is_fargate = self._is_fargate_environment()
+
+        # In Fargate, the security credentials URL doesn't include the role name
+        # In EC2, we need to append the role name to the URL
+        if is_fargate:
+            url = self._security_credentials_url
+        else:
+            url = "{}/{}".format(self._security_credentials_url, role_name)
+
         response = request(
-            url="{}/{}".format(self._security_credentials_url, role_name),
+            url=url,
             method="GET",
             headers=headers,
         )
@@ -556,6 +572,29 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
         credentials_response = json.loads(response_body)
 
         return credentials_response
+
+    def _is_fargate_environment(self):
+        """Detects if the current environment is AWS ECS Fargate.
+
+        Returns:
+            bool: True if running in AWS ECS Fargate, False otherwise.
+        """
+        # Check for ECS container metadata URI v4, which is available in Fargate
+        ecs_metadata_uri_v4 = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
+        if ecs_metadata_uri_v4:
+            return True
+
+        # Check for ECS container metadata URI (v3), also available in Fargate
+        ecs_metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI")
+        if ecs_metadata_uri:
+            return True
+
+        # Check AWS execution environment variable
+        aws_execution_env = os.environ.get("AWS_EXECUTION_ENV", "")
+        if "AWS_ECS_FARGATE" in aws_execution_env:
+            return True
+
+        return False
 
     def _get_metadata_role_name(self, request, imdsv2_session_token):
         """Retrieves the AWS role currently attached to the current AWS
