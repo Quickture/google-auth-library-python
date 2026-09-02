@@ -62,6 +62,14 @@ IMDSV2_SESSION_TOKEN_URL_IPV6 = "http://[fd00:ec2::254]/latest/api/token"
 SECURITY_CREDS_URL_IPV6 = (
     "http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials"
 )
+# The Amazon ECS task metadata endpoint, and the task metadata URI the ECS
+# agent injects into the container environment.
+ECS_CONTAINER_METADATA_URI = "http://169.254.170.2/v4/61e109b3b4b34e5f"
+ECS_TASK_METADATA_URL = ECS_CONTAINER_METADATA_URI + "/task"
+# The ECS container credential provider path the ECS agent injects into the
+# container environment, and the URL it resolves to.
+ECS_CREDENTIALS_RELATIVE_URI = "/v2/credentials/9f2a3b1c-4d5e"
+ECS_CREDENTIALS_URL = "http://169.254.170.2/v2/credentials/9f2a3b1c-4d5e"
 CRED_VERIFICATION_URL = (
     "https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"
 )
@@ -707,6 +715,13 @@ class TestCredentials(object):
         "Token": TOKEN,
     }
     AWS_IMDSV2_SESSION_TOKEN = "awsimdsv2sessiontoken"
+    # Abbreviated ECS task metadata response. The task ARN is the field the
+    # region is read from.
+    ECS_TASK_METADATA_RESPONSE = {
+        "Cluster": "default",
+        "TaskARN": "arn:aws:ecs:us-east-2:123456789012:task/default/61e109b3",
+        "AvailabilityZone": "us-east-2b",
+    }
     AWS_SIGNATURE_TIME = "2020-08-11T06:55:22Z"
     CREDENTIAL_SOURCE = {
         "environment_id": "aws1",
@@ -864,6 +879,27 @@ class TestCredentials(object):
 
         request = mock.create_autospec(transport.Request)
         request.side_effect = responses
+
+        return request
+
+    @classmethod
+    def make_mock_request_sequence(cls, *responses):
+        """Utility function to generate a mock HTTP request object that returns
+        the given (status, data) pairs, in order.
+
+        Any call beyond the given responses raises, so a test that lists every
+        endpoint it expects also asserts that nothing else -- the EC2 instance
+        metadata server in particular -- is contacted.
+        """
+        mock_responses = []
+        for status, data in responses:
+            response = mock.create_autospec(transport.Response, instance=True)
+            response.status = status
+            response.data = data
+            mock_responses.append(response)
+
+        request = mock.create_autospec(transport.Request)
+        request.side_effect = mock_responses
 
         return request
 
@@ -2276,18 +2312,31 @@ class TestCredentials(object):
         credentials.retrieve_subject_token(request)
 
     @mock.patch("google.auth._helpers.utcnow")
-    @mock.patch.dict(os.environ, {"ECS_CONTAINER_METADATA_URI_V4": "http://169.254.170.2/v4/credentials"})
-    def test_retrieve_subject_token_success_fargate_environment_v4(self, utcnow):
-        """Test that Fargate environment is detected via ECS_CONTAINER_METADATA_URI_V4 and credentials are retrieved without role name."""
+    @mock.patch.dict(
+        os.environ,
+        {
+            "ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_success_ecs_container_credentials(self, utcnow):
+        """An ECS task, such as one on the Fargate launch type, reads its region
+        from the task metadata endpoint and its credentials from the container
+        credential provider, and never touches the EC2 instance metadata server
+        that the credential source names."""
         utcnow.return_value = datetime.datetime.strptime(
             self.AWS_SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
         )
-        # In Fargate, we don't need to query for role name, so only region and security credentials requests
-        request = self.make_mock_request(
-            region_status=http_client.OK,
-            region_name=self.AWS_REGION,
-            security_credentials_status=http_client.OK,
-            security_credentials_data=self.AWS_SECURITY_CREDENTIALS_RESPONSE,
+        request = self.make_mock_request_sequence(
+            (
+                http_client.OK,
+                json.dumps(self.ECS_TASK_METADATA_RESPONSE).encode("utf-8"),
+            ),
+            (
+                http_client.OK,
+                json.dumps(self.AWS_SECURITY_CREDENTIALS_RESPONSE).encode("utf-8"),
+            ),
         )
         credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
 
@@ -2296,31 +2345,44 @@ class TestCredentials(object):
         assert subject_token == self.make_serialized_aws_signed_request(
             aws.AwsSecurityCredentials(ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN)
         )
-        # Assert region request.
+        # Assert task metadata request, used to determine the region.
         self.assert_aws_metadata_request_kwargs(
-            request.call_args_list[0][1], REGION_URL
+            request.call_args_list[0][1], ECS_TASK_METADATA_URL
         )
-        # Assert security credentials request (without role name appended).
+        # Assert container credential provider request.
         self.assert_aws_metadata_request_kwargs(
             request.call_args_list[1][1],
-            SECURITY_CREDS_URL,  # Note: no role name appended
+            ECS_CREDENTIALS_URL,
             {"Content-Type": "application/json"},
         )
-        # Should only be 2 requests (no role name request)
+        # No role name request, and no IMDSv2 session token request.
         assert len(request.call_args_list) == 2
+        # A Fargate task cannot route to the EC2 instance metadata server.
+        for call_kwargs in [call[1] for call in request.call_args_list]:
+            assert "169.254.169.254" not in call_kwargs["url"]
 
     @mock.patch("google.auth._helpers.utcnow")
-    @mock.patch.dict(os.environ, {"ECS_CONTAINER_METADATA_URI": "http://169.254.170.2/v3/credentials"})
-    def test_retrieve_subject_token_success_fargate_environment_v3(self, utcnow):
-        """Test that Fargate environment is detected via ECS_CONTAINER_METADATA_URI and credentials are retrieved without role name."""
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_ecs_container_credentials_with_env_region(
+        self, utcnow
+    ):
+        """With the region in the environment, the container credential provider
+        is the only endpoint contacted."""
         utcnow.return_value = datetime.datetime.strptime(
             self.AWS_SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
         )
-        request = self.make_mock_request(
-            region_status=http_client.OK,
-            region_name=self.AWS_REGION,
-            security_credentials_status=http_client.OK,
-            security_credentials_data=self.AWS_SECURITY_CREDENTIALS_RESPONSE,
+        request = self.make_mock_request_sequence(
+            (
+                http_client.OK,
+                json.dumps(self.AWS_SECURITY_CREDENTIALS_RESPONSE).encode("utf-8"),
+            )
         )
         credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
 
@@ -2329,178 +2391,225 @@ class TestCredentials(object):
         assert subject_token == self.make_serialized_aws_signed_request(
             aws.AwsSecurityCredentials(ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN)
         )
-        # Assert region request.
         self.assert_aws_metadata_request_kwargs(
-            request.call_args_list[0][1], REGION_URL
+            request.call_args_list[0][1],
+            ECS_CREDENTIALS_URL,
+            {"Content-Type": "application/json"},
         )
-        # Assert security credentials request (without role name appended).
+        assert len(request.call_args_list) == 1
+
+    @mock.patch("google.auth._helpers.utcnow")
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+            "AWS_ACCESS_KEY_ID": ACCESS_KEY_ID,
+            "AWS_SECRET_ACCESS_KEY": SECRET_ACCESS_KEY,
+            "AWS_SESSION_TOKEN": TOKEN,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_env_credentials_precede_container_provider(
+        self, utcnow
+    ):
+        """Credentials in the environment still win over the container provider."""
+        utcnow.return_value = datetime.datetime.strptime(
+            self.AWS_SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
+        )
+        request = self.make_mock_request_sequence()
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        subject_token = credentials.retrieve_subject_token(request)
+
+        assert subject_token == self.make_serialized_aws_signed_request(
+            aws.AwsSecurityCredentials(ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN)
+        )
+        assert len(request.call_args_list) == 0
+
+    @mock.patch("google.auth._helpers.utcnow")
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI,
+            "AWS_EXECUTION_ENV": "AWS_ECS_FARGATE",
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_ecs_task_metadata_alone_keeps_role_name_lookup(
+        self, utcnow
+    ):
+        """The ECS task metadata variables are injected on the EC2 launch type as
+        well, and AWS_EXECUTION_ENV describes the launch type, not which
+        credential endpoint exists. Without a container credential provider in
+        the environment, credentials must still be read from the EC2 instance
+        metadata server, role name and all."""
+        utcnow.return_value = datetime.datetime.strptime(
+            self.AWS_SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
+        )
+        request = self.make_mock_request_sequence(
+            (http_client.OK, self.AWS_ROLE.encode("utf-8")),
+            (
+                http_client.OK,
+                json.dumps(self.AWS_SECURITY_CREDENTIALS_RESPONSE).encode("utf-8"),
+            ),
+        )
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        subject_token = credentials.retrieve_subject_token(request)
+
+        assert subject_token == self.make_serialized_aws_signed_request(
+            aws.AwsSecurityCredentials(ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN)
+        )
+        # Assert role name request.
+        self.assert_aws_metadata_request_kwargs(
+            request.call_args_list[0][1], SECURITY_CREDS_URL
+        )
+        # Assert security credentials request, with the role name appended.
         self.assert_aws_metadata_request_kwargs(
             request.call_args_list[1][1],
-            SECURITY_CREDS_URL,  # Note: no role name appended
-            {"Content-Type": "application/json"},
-        )
-        # Should only be 2 requests (no role name request)
-        assert len(request.call_args_list) == 2
-
-    @mock.patch("google.auth._helpers.utcnow")
-    @mock.patch.dict(os.environ, {"AWS_EXECUTION_ENV": "AWS_ECS_FARGATE"})
-    def test_retrieve_subject_token_success_fargate_environment_execution_env(self, utcnow):
-        """Test that Fargate environment is detected via AWS_EXECUTION_ENV and credentials are retrieved without role name."""
-        utcnow.return_value = datetime.datetime.strptime(
-            self.AWS_SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
-        )
-        request = self.make_mock_request(
-            region_status=http_client.OK,
-            region_name=self.AWS_REGION,
-            security_credentials_status=http_client.OK,
-            security_credentials_data=self.AWS_SECURITY_CREDENTIALS_RESPONSE,
-        )
-        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
-
-        subject_token = credentials.retrieve_subject_token(request)
-
-        assert subject_token == self.make_serialized_aws_signed_request(
-            aws.AwsSecurityCredentials(ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN)
-        )
-        # Assert region request.
-        self.assert_aws_metadata_request_kwargs(
-            request.call_args_list[0][1], REGION_URL
-        )
-        # Assert security credentials request (without role name appended).
-        self.assert_aws_metadata_request_kwargs(
-            request.call_args_list[1][1],
-            SECURITY_CREDS_URL,  # Note: no role name appended
-            {"Content-Type": "application/json"},
-        )
-        # Should only be 2 requests (no role name request)
-        assert len(request.call_args_list) == 2
-
-    @mock.patch("google.auth._helpers.utcnow")
-    @mock.patch.dict(os.environ, {}, clear=True)
-    def test_retrieve_subject_token_success_non_fargate_environment(self, utcnow):
-        """Test that non-Fargate environment works as before with role name retrieval."""
-        utcnow.return_value = datetime.datetime.strptime(
-            self.AWS_SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
-        )
-        request = self.make_mock_request(
-            region_status=http_client.OK,
-            region_name=self.AWS_REGION,
-            role_status=http_client.OK,
-            role_name=self.AWS_ROLE,
-            security_credentials_status=http_client.OK,
-            security_credentials_data=self.AWS_SECURITY_CREDENTIALS_RESPONSE,
-        )
-        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
-
-        subject_token = credentials.retrieve_subject_token(request)
-
-        assert subject_token == self.make_serialized_aws_signed_request(
-            aws.AwsSecurityCredentials(ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN)
-        )
-        # Assert region request.
-        self.assert_aws_metadata_request_kwargs(
-            request.call_args_list[0][1], REGION_URL
-        )
-        # Assert role request.
-        self.assert_aws_metadata_request_kwargs(
-            request.call_args_list[1][1], SECURITY_CREDS_URL
-        )
-        # Assert security credentials request (with role name appended).
-        self.assert_aws_metadata_request_kwargs(
-            request.call_args_list[2][1],
             "{}/{}".format(SECURITY_CREDS_URL, self.AWS_ROLE),
             {"Content-Type": "application/json"},
         )
-        # Should be 3 requests (including role name request)
-        assert len(request.call_args_list) == 3
+        assert len(request.call_args_list) == 2
 
-    @mock.patch("google.auth._helpers.utcnow")
-    @mock.patch.dict(os.environ, {"ECS_CONTAINER_METADATA_URI_V4": "http://169.254.170.2/v4/credentials"})
-    def test_retrieve_subject_token_success_fargate_with_imdsv2(self, utcnow):
-        """Test Fargate environment with IMDSv2 session token."""
-        utcnow.return_value = datetime.datetime.strptime(
-            self.AWS_SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
-        )
-        request = self.make_mock_request(
-            region_status=http_client.OK,
-            region_name=self.AWS_REGION,
-            security_credentials_status=http_client.OK,
-            security_credentials_data=self.AWS_SECURITY_CREDENTIALS_RESPONSE,
-            imdsv2_session_token_status=http_client.OK,
-            imdsv2_session_token_data=self.AWS_IMDSV2_SESSION_TOKEN,
-        )
-        credential_source_token_url = self.CREDENTIAL_SOURCE.copy()
-        credential_source_token_url[
-            "imdsv2_session_token_url"
-        ] = IMDSV2_SESSION_TOKEN_URL
-        credentials = self.make_credentials(
-            credential_source=credential_source_token_url
-        )
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_error_no_url_in_ecs_environment(self):
+        """A credential source without a url is rejected before any request is
+        made, on an ECS host as anywhere else."""
+        credential_source = self.CREDENTIAL_SOURCE.copy()
+        credential_source.pop("url")
+        request = self.make_mock_request_sequence()
+        credentials = self.make_credentials(credential_source=credential_source)
 
-        subject_token = credentials.retrieve_subject_token(request)
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
 
-        assert subject_token == self.make_serialized_aws_signed_request(
-            aws.AwsSecurityCredentials(ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN)
+        assert excinfo.match(
+            r"Unable to determine the AWS metadata server security credentials endpoint"
         )
-        # Assert session token request
-        self.assert_aws_metadata_request_kwargs(
-            request.call_args_list[0][1],
-            IMDSV2_SESSION_TOKEN_URL,
-            {"X-aws-ec2-metadata-token-ttl-seconds": "300"},
-            "PUT",
-        )
-        # Assert region request.
-        self.assert_aws_metadata_request_kwargs(
-            request.call_args_list[1][1],
-            REGION_URL,
-            {"X-aws-ec2-metadata-token": self.AWS_IMDSV2_SESSION_TOKEN},
-        )
-        # Assert session token request for credentials
-        self.assert_aws_metadata_request_kwargs(
-            request.call_args_list[2][1],
-            IMDSV2_SESSION_TOKEN_URL,
-            {"X-aws-ec2-metadata-token-ttl-seconds": "300"},
-            "PUT",
-        )
-        # Assert security credentials request (without role name appended).
-        self.assert_aws_metadata_request_kwargs(
-            request.call_args_list[3][1],
-            SECURITY_CREDS_URL,  # Note: no role name appended
-            {
-                "Content-Type": "application/json",
-                "X-aws-ec2-metadata-token": self.AWS_IMDSV2_SESSION_TOKEN,
-            },
-        )
-        # Should be 4 requests (no role name request in Fargate)
-        assert len(request.call_args_list) == 4
+        assert len(request.call_args_list) == 0
 
-    def test_is_fargate_environment_detection(self):
-        """Test the _is_fargate_environment method directly."""
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_error_container_provider(self):
+        request = self.make_mock_request_sequence(
+            (http_client.BAD_REQUEST, b"unable to assume role")
+        )
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(r"Unable to retrieve AWS security credentials")
+
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_get_container_credentials_url_without_ecs_environment(self):
         supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
 
-        # Test with no Fargate environment variables
-        with mock.patch.dict(os.environ, {}, clear=True):
-            assert not supplier._is_fargate_environment()
+        assert supplier._get_container_credentials_url() is None
 
-        # Test with ECS_CONTAINER_METADATA_URI_V4
-        with mock.patch.dict(os.environ, {"ECS_CONTAINER_METADATA_URI_V4": "http://169.254.170.2/v4/credentials"}):
-            assert supplier._is_fargate_environment()
+    @mock.patch.dict(
+        os.environ,
+        {"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "http://metadata.example.com/creds"},
+        clear=True,
+    )
+    def test_get_container_credentials_url_stays_on_the_link_local_host(self):
+        """The credential path comes from the environment, so a value shaped like
+        a full URL must not redirect the credential request off the host."""
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
 
-        # Test with ECS_CONTAINER_METADATA_URI
-        with mock.patch.dict(os.environ, {"ECS_CONTAINER_METADATA_URI": "http://169.254.170.2/v3/credentials"}):
-            assert supplier._is_fargate_environment()
+        url = supplier._get_container_credentials_url()
 
-        # Test with AWS_EXECUTION_ENV containing AWS_ECS_FARGATE
-        with mock.patch.dict(os.environ, {"AWS_EXECUTION_ENV": "AWS_ECS_FARGATE"}):
-            assert supplier._is_fargate_environment()
+        assert urllib.parse.urlsplit(url).hostname == "169.254.170.2"
 
-        # Test with AWS_EXECUTION_ENV containing AWS_ECS_FARGATE as part of a larger string
-        with mock.patch.dict(os.environ, {"AWS_EXECUTION_ENV": "some_prefix_AWS_ECS_FARGATE_some_suffix"}):
-            assert supplier._is_fargate_environment()
+    @mock.patch.dict(
+        os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI},
+        clear=True,
+    )
+    def test_get_aws_region_from_ecs_task_metadata(self):
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (
+                http_client.OK,
+                json.dumps(self.ECS_TASK_METADATA_RESPONSE).encode("utf-8"),
+            )
+        )
 
-        # Test with AWS_EXECUTION_ENV not containing AWS_ECS_FARGATE
-        with mock.patch.dict(os.environ, {"AWS_EXECUTION_ENV": "AWS_ECS_EC2"}):
-            assert not supplier._is_fargate_environment()
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        self.assert_aws_metadata_request_kwargs(
+            request.call_args_list[0][1], ECS_TASK_METADATA_URL
+        )
+        assert len(request.call_args_list) == 1
+
+    @mock.patch.dict(
+        os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI},
+        clear=True,
+    )
+    def test_get_aws_region_falls_back_to_metadata_server_on_ecs_error(self):
+        """The task metadata lookup is best effort: the EC2 instance metadata
+        server stays the fallback for workloads that can reach it."""
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (http_client.INTERNAL_SERVER_ERROR, b"internal error"),
+            (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8")),
+        )
+
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        assert [call[1]["url"] for call in request.call_args_list] == [
+            ECS_TASK_METADATA_URL,
+            REGION_URL,
+        ]
+
+    @mock.patch.dict(
+        os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI},
+        clear=True,
+    )
+    def test_get_aws_region_falls_back_when_task_metadata_has_no_arn(self):
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (http_client.OK, json.dumps({"Cluster": "default"}).encode("utf-8")),
+            (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8")),
+        )
+
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        assert [call[1]["url"] for call in request.call_args_list] == [
+            ECS_TASK_METADATA_URL,
+            REGION_URL,
+        ]
+
+    @mock.patch.dict(
+        os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": "http://metadata.example.com/v4/task"},
+        clear=True,
+    )
+    def test_get_aws_region_ignores_non_link_local_task_metadata_uri(self):
+        """The task metadata URI comes from the environment; only the local
+        metadata endpoint is ever contacted."""
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8"))
+        )
+
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        assert [call[1]["url"] for call in request.call_args_list] == [REGION_URL]
 
     def test_retrieve_subject_token_error_with_supplier(self):
         request = self.make_mock_request()

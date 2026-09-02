@@ -43,6 +43,7 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import http.client as http_client
+import ipaddress
 import json
 import os
 import posixpath
@@ -71,6 +72,48 @@ _DEFAULT_AWS_REGIONAL_CREDENTIAL_VERIFICATION_URL = (
 )
 # IMDSV2 session token lifetime. This is set to a low value because the session token is used immediately.
 _IMDSV2_SESSION_TOKEN_TTL_SECONDS = "300"
+# The Amazon ECS container credential provider endpoint. ECS tasks -- including
+# tasks on the Fargate launch type, which have no route to the EC2 instance
+# metadata server -- retrieve their task role credentials from this link-local
+# address at the path the ECS agent injects into the container environment.
+# https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html
+_ECS_CONTAINER_CREDENTIALS_HOST = "http://169.254.170.2"
+# Environment variable holding the path of the ECS container credential
+# provider for the current task. Injected by the ECS agent into every task
+# container that has a task role, on both the EC2 and Fargate launch types.
+_ECS_CONTAINER_CREDENTIALS_RELATIVE_URI_ENV = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+# Environment variables holding the base URI of the ECS task metadata endpoint.
+# The v4 variable is injected by current ECS agents; the unversioned one is the
+# older v3 endpoint.
+_ECS_CONTAINER_METADATA_URI_V4_ENV = "ECS_CONTAINER_METADATA_URI_V4"
+_ECS_CONTAINER_METADATA_URI_ENV = "ECS_CONTAINER_METADATA_URI"
+
+
+def _is_loopback_or_link_local(url):
+    """Returns whether a URL addresses a loopback or link-local host.
+
+    Used to bound URLs that are read from the environment: the local AWS
+    metadata endpoints all live on loopback or link-local addresses, so a value
+    pointing anywhere else is not a metadata endpoint and is not contacted.
+
+    Args:
+        url (str): The URL to check.
+
+    Returns:
+        bool: True if the URL host is loopback or link-local.
+    """
+    hostname = urllib.parse.urlsplit(url).hostname
+    if not hostname:
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        # Not an IP literal, so not one of the local metadata endpoints.
+        return False
+
+    return address.is_loopback or address.is_link_local
 
 
 class RequestSigner(object):
@@ -434,19 +477,25 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
                 env_aws_access_key_id, env_aws_secret_access_key, env_aws_session_token
             )
 
-        imdsv2_session_token = self._get_imdsv2_session_token(request)
-        is_fargate = self._is_fargate_environment()
-
-        # In Fargate, we don't need to retrieve the role name as the metadata
-        # endpoint doesn't include role names in the URL structure
-        role_name = None
-        if not is_fargate:
+        # Amazon ECS tasks, including tasks on the Fargate launch type, get
+        # their task role credentials from the ECS container credential
+        # provider rather than from EC2 instance metadata. Prefer it whenever
+        # it is available, matching the AWS SDK credential chain; on Fargate it
+        # is the only option, because the EC2 instance metadata server used
+        # below is not routable from the task.
+        container_credentials_url = self._get_container_credentials_url()
+        if container_credentials_url is not None:
+            credentials = self._get_container_security_credentials(
+                request, container_credentials_url
+            )
+        else:
+            imdsv2_session_token = self._get_imdsv2_session_token(request)
             role_name = self._get_metadata_role_name(request, imdsv2_session_token)
 
-        # Get security credentials.
-        credentials = self._get_metadata_security_credentials(
-            request, role_name, imdsv2_session_token
-        )
+            # Get security credentials.
+            credentials = self._get_metadata_security_credentials(
+                request, role_name, imdsv2_session_token
+            )
 
         return AwsSecurityCredentials(
             credentials.get("AccessKeyId"),
@@ -466,6 +515,14 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
         env_aws_region = os.environ.get(environment_vars.AWS_DEFAULT_REGION)
         if env_aws_region is not None:
             return env_aws_region
+
+        # On Amazon ECS the region is available from the task metadata
+        # endpoint. This is the only in-task source on the Fargate launch type,
+        # where the region URL below points at the EC2 instance metadata
+        # server, which the task cannot reach.
+        ecs_task_region = self._get_ecs_task_region(request)
+        if ecs_task_region is not None:
+            return ecs_task_region
 
         if not self._region_url:
             raise exceptions.RefreshError("Unable to determine AWS region")
@@ -525,7 +582,7 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
                 HTTP requests.
             role_name (str): The AWS role name required by the AWS metadata
                 server security_credentials endpoint in order to return the
-                credentials. Not used in Fargate environments.
+                credentials.
             imdsv2_session_token (str): The AWS IMDSv2 session token to be added as a
                 header in the requests to AWS metadata endpoint.
 
@@ -541,18 +598,8 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
         if imdsv2_session_token is not None:
             headers["X-aws-ec2-metadata-token"] = imdsv2_session_token
 
-        # Detect Fargate environment to determine URL structure
-        is_fargate = self._is_fargate_environment()
-
-        # In Fargate, the security credentials URL doesn't include the role name
-        # In EC2, we need to append the role name to the URL
-        if is_fargate:
-            url = self._security_credentials_url
-        else:
-            url = "{}/{}".format(self._security_credentials_url, role_name)
-
         response = request(
-            url=url,
+            url="{}/{}".format(self._security_credentials_url, role_name),
             method="GET",
             headers=headers,
         )
@@ -573,28 +620,126 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
 
         return credentials_response
 
-    def _is_fargate_environment(self):
-        """Detects if the current environment is AWS ECS Fargate.
+    def _get_container_credentials_url(self):
+        """Returns the ECS container credential provider URL for this task.
+
+        The ECS agent injects the credential path into the container
+        environment. Its presence is what makes the container credential
+        provider usable; the ECS task metadata variables are injected on both
+        the EC2 and Fargate launch types and say nothing about which credential
+        endpoint is reachable, so they are not used for this decision.
+
+        ``AWS_CONTAINER_CREDENTIALS_FULL_URI`` is deliberately not honored. It
+        names an arbitrary host from the environment and is paired with a
+        bearer token in ``AWS_CONTAINER_AUTHORIZATION_TOKEN``; ECS tasks are
+        always served by the link-local provider below, so there is no reason
+        to let a credential request, or that token, leave the host.
 
         Returns:
-            bool: True if running in AWS ECS Fargate, False otherwise.
+            Optional[str]: The ECS container credential provider URL, or None if
+                the current environment does not expose one.
         """
-        # Check for ECS container metadata URI v4, which is available in Fargate
-        ecs_metadata_uri_v4 = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
-        if ecs_metadata_uri_v4:
-            return True
+        relative_uri = os.environ.get(_ECS_CONTAINER_CREDENTIALS_RELATIVE_URI_ENV)
+        if not relative_uri:
+            return None
 
-        # Check for ECS container metadata URI (v3), also available in Fargate
-        ecs_metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI")
-        if ecs_metadata_uri:
-            return True
+        # The path comes from the environment, so it is appended to the
+        # link-local host rather than joined as a URL: that keeps the request
+        # on the metadata endpoint even if the value looks like a full URL.
+        return "{}/{}".format(_ECS_CONTAINER_CREDENTIALS_HOST, relative_uri.lstrip("/"))
 
-        # Check AWS execution environment variable
-        aws_execution_env = os.environ.get("AWS_EXECUTION_ENV", "")
-        if "AWS_ECS_FARGATE" in aws_execution_env:
-            return True
+    def _get_container_security_credentials(self, request, url):
+        """Retrieves the AWS security credentials of the current ECS task role
+        from the ECS container credential provider.
 
-        return False
+        Args:
+            request (google.auth.transport.Request): A callable used to make
+                HTTP requests.
+            url (str): The ECS container credential provider URL, as returned by
+                :meth:`_get_container_credentials_url`.
+
+        Returns:
+            Mapping[str, str]: The ECS container credential provider response,
+                in the same shape as the AWS metadata server response.
+
+        Raises:
+            google.auth.exceptions.RefreshError: If an error occurs while
+                retrieving the AWS security credentials.
+        """
+        # The provider is reached over the link-local address and requires no
+        # authorization header, so no token is sent to it.
+        response = request(
+            url=url, method="GET", headers={"Content-Type": "application/json"}
+        )
+
+        # support both string and bytes type response.data
+        response_body = (
+            response.data.decode("utf-8")
+            if hasattr(response.data, "decode")
+            else response.data
+        )
+
+        if response.status != http_client.OK:
+            raise exceptions.RefreshError(
+                "Unable to retrieve AWS security credentials: {}".format(response_body)
+            )
+
+        return json.loads(response_body)
+
+    def _get_ecs_task_region(self, request):
+        """Best effort lookup of the AWS region from the ECS task metadata
+        endpoint.
+
+        The ECS agent injects the task metadata base URI into every task
+        container. The task response carries the task ARN, whose fourth field
+        is the region.
+
+        Returns None instead of raising when the region cannot be determined
+        this way, so that the EC2 instance metadata server stays the fallback
+        for workloads where it is reachable.
+
+        Args:
+            request (google.auth.transport.Request): A callable used to make
+                HTTP requests.
+
+        Returns:
+            Optional[str]: The AWS region, or None if it could not be determined.
+        """
+        metadata_uri = os.environ.get(
+            _ECS_CONTAINER_METADATA_URI_V4_ENV
+        ) or os.environ.get(_ECS_CONTAINER_METADATA_URI_ENV)
+        if request is None or not metadata_uri:
+            return None
+
+        # The URI comes from the environment; only the local metadata endpoint
+        # is ever contacted.
+        if not _is_loopback_or_link_local(metadata_uri):
+            return None
+
+        response = request(url="{}/task".format(metadata_uri.rstrip("/")), method="GET")
+
+        # support both string and bytes type response.data
+        response_body = (
+            response.data.decode("utf-8")
+            if hasattr(response.data, "decode")
+            else response.data
+        )
+
+        if response.status != http_client.OK:
+            return None
+
+        try:
+            task_arn = json.loads(response_body).get("TaskARN") or ""
+        except (ValueError, AttributeError):
+            # Not a JSON object, so not a task metadata response.
+            return None
+
+        # arn:<partition>:ecs:<region>:<account id>:task/...
+        arn_fields = task_arn.split(":")
+        if len(arn_fields) > 3 and arn_fields[3]:
+            return arn_fields[3]
+
+        return None
 
     def _get_metadata_role_name(self, request, imdsv2_session_token):
         """Retrieves the AWS role currently attached to the current AWS
@@ -762,11 +907,13 @@ class Credentials(external_account.Credentials):
         The logic is summarized as:
 
         Retrieve the AWS region from the AWS_REGION or AWS_DEFAULT_REGION
-        environment variable or from the AWS metadata server availability-zone
-        if not found in the environment variable.
+        environment variable, from the Amazon ECS task metadata endpoint, or
+        from the AWS metadata server availability-zone, in that order.
 
         Check AWS credentials in environment variables. If not found, retrieve
-        from the AWS metadata server security-credentials endpoint.
+        them from the Amazon ECS container credential provider when the task
+        environment exposes one, and otherwise from the AWS metadata server
+        security-credentials endpoint.
 
         When retrieving AWS credentials from the metadata server
         security-credentials endpoint, the AWS role needs to be determined by
