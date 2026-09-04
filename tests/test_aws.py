@@ -614,6 +614,41 @@ TEST_FIXTURES = [
 ]
 
 
+class TestIsLinkLocal(object):
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://169.254.169.254/latest/meta-data",
+            "http://169.254.170.2/v2/credentials/abc",
+            "http://169.254.170.2:80/v4/task",
+            "http://[fe80::1]/v4/task",
+        ],
+    )
+    def test_link_local_hosts(self, url):
+        assert aws._is_link_local(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Loopback is not an AWS metadata endpoint, so an environment
+            # variable pointing there must not be contacted.
+            "http://127.0.0.1/v4/task",
+            "http://127.0.0.1:8080/v4/task",
+            "http://localhost/v4/task",
+            "http://[::1]/v4/task",
+            "http://metadata.example.com/v4/task",
+            # An IP-shaped host that is not link-local.
+            "http://169.254.169.254.example.com/v4/task",
+            "http://10.0.0.1/v4/task",
+            # No host at all.
+            "/v4/task",
+            "",
+        ],
+    )
+    def test_other_hosts(self, url):
+        assert aws._is_link_local(url) is False
+
+
 class TestRequestSigner(object):
     @pytest.mark.parametrize(
         "region, time, credentials, original_request, signed_request", TEST_FIXTURES
@@ -2597,11 +2632,28 @@ class TestCredentials(object):
 
     @mock.patch.dict(
         os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": "http://127.0.0.1:8080/v4"},
+        clear=True,
+    )
+    def test_get_aws_region_ignores_loopback_task_metadata_uri(self):
+        """No AWS metadata endpoint lives on loopback, so a task metadata URI
+        pointing there is a spoofed value rather than a metadata endpoint and
+        must not be contacted."""
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8"))
+        )
+
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        assert [call[1]["url"] for call in request.call_args_list] == [REGION_URL]
+
+    @mock.patch.dict(
+        os.environ,
         {"ECS_CONTAINER_METADATA_URI_V4": "http://metadata.example.com/v4/task"},
         clear=True,
     )
     def test_get_aws_region_ignores_non_link_local_task_metadata_uri(self):
-        """The task metadata URI comes from the environment; only the local
+        """The task metadata URI comes from the environment; only the link-local
         metadata endpoint is ever contacted."""
         supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
         request = self.make_mock_request_sequence(

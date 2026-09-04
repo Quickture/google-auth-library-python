@@ -89,31 +89,33 @@ _ECS_CONTAINER_METADATA_URI_V4_ENV = "ECS_CONTAINER_METADATA_URI_V4"
 _ECS_CONTAINER_METADATA_URI_ENV = "ECS_CONTAINER_METADATA_URI"
 
 
-def _is_loopback_or_link_local(url):
-    """Returns whether a URL addresses a loopback or link-local host.
+def _is_link_local(url):
+    """Returns whether a URL addresses a link-local host.
 
-    Used to bound URLs that are read from the environment: the local AWS
-    metadata endpoints all live on loopback or link-local addresses, so a value
-    pointing anywhere else is not a metadata endpoint and is not contacted.
+    Used to bound URLs that are read from the environment. Every AWS metadata
+    endpoint a workload can reach is a link-local IP literal: the EC2 instance
+    metadata server at ``169.254.169.254`` and the ECS task metadata and
+    container credential endpoints at ``169.254.170.2``. Nothing that serves
+    this data lives on loopback, so a value pointing anywhere else -- loopback
+    and ``localhost`` included -- is not a metadata endpoint and is not
+    contacted.
 
     Args:
         url (str): The URL to check.
 
     Returns:
-        bool: True if the URL host is loopback or link-local.
+        bool: True if the URL host is a link-local IP literal.
     """
     hostname = urllib.parse.urlsplit(url).hostname
     if not hostname:
         return False
-    if hostname == "localhost":
-        return True
     try:
         address = ipaddress.ip_address(hostname)
     except ValueError:
-        # Not an IP literal, so not one of the local metadata endpoints.
+        # Not an IP literal, so not one of the metadata endpoints.
         return False
 
-    return address.is_loopback or address.is_link_local
+    return address.is_link_local
 
 
 class RequestSigner(object):
@@ -711,9 +713,9 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
         if request is None or not metadata_uri:
             return None
 
-        # The URI comes from the environment; only the local metadata endpoint
-        # is ever contacted.
-        if not _is_loopback_or_link_local(metadata_uri):
+        # The URI comes from the environment; only the link-local metadata
+        # endpoint is ever contacted.
+        if not _is_link_local(metadata_uri):
             return None
 
         response = request(url="{}/task".format(metadata_uri.rstrip("/")), method="GET")
