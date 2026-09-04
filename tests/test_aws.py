@@ -2552,6 +2552,34 @@ class TestCredentials(object):
 
         assert excinfo.match(r"Unable to retrieve AWS security credentials")
 
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_error_container_provider_non_json(self):
+        """A 200 response that is not a credentials document fails as a
+        RefreshError like every other credential retrieval failure, rather than
+        letting a JSON decoding error escape refresh."""
+        request = self.make_mock_request_sequence(
+            (http_client.OK, b"<html>not a credentials document</html>")
+        )
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(
+            r"Unable to parse the AWS security credentials returned by the "
+            r"ECS container credential provider"
+        )
+        # The response body is not echoed: a credentials document truncated in
+        # transit fails to parse and still carries a secret access key.
+        assert "not a credentials document" not in str(excinfo.value)
+
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_get_container_credentials_url_without_ecs_environment(self):
         supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
@@ -2621,6 +2649,36 @@ class TestCredentials(object):
         supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
         request = self.make_mock_request_sequence(
             (http_client.OK, json.dumps({"Cluster": "default"}).encode("utf-8")),
+            (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8")),
+        )
+
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        assert [call[1]["url"] for call in request.call_args_list] == [
+            ECS_TASK_METADATA_URL,
+            REGION_URL,
+        ]
+
+    @mock.patch.dict(
+        os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI},
+        clear=True,
+    )
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # Not JSON at all.
+            b"<html>not task metadata</html>",
+            # JSON, but not a task metadata object.
+            b"[]",
+        ],
+    )
+    def test_get_aws_region_falls_back_when_task_metadata_is_not_json(self, body):
+        """A 200 response that is not a task metadata document falls back to the
+        EC2 instance metadata server rather than letting a JSON decoding error
+        escape refresh."""
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (http_client.OK, body),
             (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8")),
         )
 

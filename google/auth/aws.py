@@ -686,7 +686,17 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
                 "Unable to retrieve AWS security credentials: {}".format(response_body)
             )
 
-        return json.loads(response_body)
+        try:
+            return json.loads(response_body)
+        except ValueError as caught_exc:
+            # The body is deliberately left out of the message: a credentials
+            # document truncated in transit fails to parse and still carries a
+            # secret access key.
+            new_exc = exceptions.RefreshError(
+                "Unable to parse the AWS security credentials returned by the "
+                "ECS container credential provider"
+            )
+            raise new_exc from caught_exc
 
     def _get_ecs_task_region(self, request):
         """Best effort lookup of the AWS region from the ECS task metadata
