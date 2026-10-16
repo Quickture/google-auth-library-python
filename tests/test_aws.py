@@ -2634,6 +2634,41 @@ class TestCredentials(object):
 
     @mock.patch.dict(
         os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    @pytest.mark.parametrize(
+        "status, message",
+        [
+            (
+                http_client.OK,
+                r"Unable to parse the AWS security credentials returned by the "
+                r"ECS container credential provider",
+            ),
+            (http_client.INTERNAL_SERVER_ERROR, r"HTTP 500"),
+        ],
+    )
+    def test_retrieve_subject_token_error_container_provider_not_utf8(
+        self, status, message
+    ):
+        """A body that does not decode as UTF-8 fails as a RefreshError, on the
+        error branch as well as the success branch, rather than escaping as a
+        UnicodeDecodeError -- whose ``object`` is the whole response body."""
+        body = b'\xff\xfe{"SecretAccessKey": "' + SECRET_ACCESS_KEY.encode("utf-8")
+        request = self.make_mock_request_sequence((status, body))
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(message)
+        assert SECRET_ACCESS_KEY not in str(excinfo.value)
+
+    @mock.patch.dict(
+        os.environ,
         {"AWS_REGION": AWS_REGION, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ""},
         clear=True,
     )
