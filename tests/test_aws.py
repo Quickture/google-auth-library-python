@@ -2732,12 +2732,20 @@ class TestCredentials(object):
         {"ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI},
         clear=True,
     )
-    def test_get_aws_region_falls_back_to_metadata_server_on_ecs_error(self):
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b"internal error",
+            # An error body that is not UTF-8 is not decoded at all.
+            b"\xff\xfeinternal error",
+        ],
+    )
+    def test_get_aws_region_falls_back_to_metadata_server_on_ecs_error(self, body):
         """The task metadata lookup is best effort: the EC2 instance metadata
         server stays the fallback for workloads that can reach it."""
         supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
         request = self.make_mock_request_sequence(
-            (http_client.INTERNAL_SERVER_ERROR, b"internal error"),
+            (http_client.INTERNAL_SERVER_ERROR, body),
             (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8")),
         )
 
@@ -2777,11 +2785,15 @@ class TestCredentials(object):
             b"<html>not task metadata</html>",
             # JSON, but not a task metadata object.
             b"[]",
+            # Not UTF-8, so not even text.
+            b'\xff\xfe{"TaskARN": "arn:aws:ecs:us-east-2:123456789012:task/x"}',
+            # A task metadata object whose ARN is not a string.
+            b'{"TaskARN": 42}',
         ],
     )
     def test_get_aws_region_falls_back_when_task_metadata_is_not_json(self, body):
         """A 200 response that is not a task metadata document falls back to the
-        EC2 instance metadata server rather than letting a JSON decoding error
+        EC2 instance metadata server rather than letting a decoding error
         escape refresh."""
         supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
         request = self.make_mock_request_sequence(

@@ -758,20 +758,23 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
 
         response = request(url="{}/task".format(metadata_uri.rstrip("/")), method="GET")
 
-        # support both string and bytes type response.data
-        response_body = (
-            response.data.decode("utf-8")
-            if hasattr(response.data, "decode")
-            else response.data
-        )
-
         if response.status != http_client.OK:
             return None
 
         try:
+            # support both string and bytes type response.data. Decoding is
+            # inside the try: UnicodeDecodeError is a ValueError.
+            response_body = (
+                response.data.decode("utf-8")
+                if hasattr(response.data, "decode")
+                else response.data
+            )
             task_arn = json.loads(response_body).get("TaskARN") or ""
         except (ValueError, AttributeError):
             # Not a JSON object, so not a task metadata response.
+            return None
+
+        if not isinstance(task_arn, str):
             return None
 
         # arn:<partition>:ecs:<region>:<account id>:task/...
