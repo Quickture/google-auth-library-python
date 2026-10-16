@@ -62,6 +62,14 @@ IMDSV2_SESSION_TOKEN_URL_IPV6 = "http://[fd00:ec2::254]/latest/api/token"
 SECURITY_CREDS_URL_IPV6 = (
     "http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials"
 )
+# The Amazon ECS task metadata endpoint, and the task metadata URI the ECS
+# agent injects into the container environment.
+ECS_CONTAINER_METADATA_URI = "http://169.254.170.2/v4/61e109b3b4b34e5f"
+ECS_TASK_METADATA_URL = ECS_CONTAINER_METADATA_URI + "/task"
+# The ECS container credential provider path the ECS agent injects into the
+# container environment, and the URL it resolves to.
+ECS_CREDENTIALS_RELATIVE_URI = "/v2/credentials/9f2a3b1c-4d5e"
+ECS_CREDENTIALS_URL = "http://169.254.170.2/v2/credentials/9f2a3b1c-4d5e"
 CRED_VERIFICATION_URL = (
     "https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"
 )
@@ -606,6 +614,41 @@ TEST_FIXTURES = [
 ]
 
 
+class TestIsLinkLocal(object):
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://169.254.169.254/latest/meta-data",
+            "http://169.254.170.2/v2/credentials/abc",
+            "http://169.254.170.2:80/v4/task",
+            "http://[fe80::1]/v4/task",
+        ],
+    )
+    def test_link_local_hosts(self, url):
+        assert aws._is_link_local(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Loopback is not an AWS metadata endpoint, so an environment
+            # variable pointing there must not be contacted.
+            "http://127.0.0.1/v4/task",
+            "http://127.0.0.1:8080/v4/task",
+            "http://localhost/v4/task",
+            "http://[::1]/v4/task",
+            "http://metadata.example.com/v4/task",
+            # An IP-shaped host that is not link-local.
+            "http://169.254.169.254.example.com/v4/task",
+            "http://10.0.0.1/v4/task",
+            # No host at all.
+            "/v4/task",
+            "",
+        ],
+    )
+    def test_other_hosts(self, url):
+        assert aws._is_link_local(url) is False
+
+
 class TestRequestSigner(object):
     @pytest.mark.parametrize(
         "region, time, credentials, original_request, signed_request", TEST_FIXTURES
@@ -707,6 +750,13 @@ class TestCredentials(object):
         "Token": TOKEN,
     }
     AWS_IMDSV2_SESSION_TOKEN = "awsimdsv2sessiontoken"
+    # Abbreviated ECS task metadata response. The task ARN is the field the
+    # region is read from.
+    ECS_TASK_METADATA_RESPONSE = {
+        "Cluster": "default",
+        "TaskARN": "arn:aws:ecs:us-east-2:123456789012:task/default/61e109b3",
+        "AvailabilityZone": "us-east-2b",
+    }
     AWS_SIGNATURE_TIME = "2020-08-11T06:55:22Z"
     CREDENTIAL_SOURCE = {
         "environment_id": "aws1",
@@ -864,6 +914,27 @@ class TestCredentials(object):
 
         request = mock.create_autospec(transport.Request)
         request.side_effect = responses
+
+        return request
+
+    @classmethod
+    def make_mock_request_sequence(cls, *responses):
+        """Utility function to generate a mock HTTP request object that returns
+        the given (status, data) pairs, in order.
+
+        Any call beyond the given responses raises, so a test that lists every
+        endpoint it expects also asserts that nothing else -- the EC2 instance
+        metadata server in particular -- is contacted.
+        """
+        mock_responses = []
+        for status, data in responses:
+            response = mock.create_autospec(transport.Response, instance=True)
+            response.status = status
+            response.data = data
+            mock_responses.append(response)
+
+        request = mock.create_autospec(transport.Request)
+        request.side_effect = mock_responses
 
         return request
 
@@ -2274,6 +2345,534 @@ class TestCredentials(object):
         credentials = self.make_credentials(aws_security_credentials_supplier=supplier)
 
         credentials.retrieve_subject_token(request)
+
+    @mock.patch("google.auth._helpers.utcnow")
+    @mock.patch.dict(
+        os.environ,
+        {
+            "ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_success_ecs_container_credentials(self, utcnow):
+        """An ECS task, such as one on the Fargate launch type, reads its region
+        from the task metadata endpoint and its credentials from the container
+        credential provider, and never touches the EC2 instance metadata server
+        that the credential source names."""
+        utcnow.return_value = datetime.datetime.strptime(
+            self.AWS_SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
+        )
+        request = self.make_mock_request_sequence(
+            (
+                http_client.OK,
+                json.dumps(self.ECS_TASK_METADATA_RESPONSE).encode("utf-8"),
+            ),
+            (
+                http_client.OK,
+                json.dumps(self.AWS_SECURITY_CREDENTIALS_RESPONSE).encode("utf-8"),
+            ),
+        )
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        subject_token = credentials.retrieve_subject_token(request)
+
+        assert subject_token == self.make_serialized_aws_signed_request(
+            aws.AwsSecurityCredentials(ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN)
+        )
+        # Assert task metadata request, used to determine the region.
+        self.assert_aws_metadata_request_kwargs(
+            request.call_args_list[0][1], ECS_TASK_METADATA_URL
+        )
+        # Assert container credential provider request.
+        self.assert_aws_metadata_request_kwargs(
+            request.call_args_list[1][1],
+            ECS_CREDENTIALS_URL,
+            {"Content-Type": "application/json"},
+        )
+        # No role name request, and no IMDSv2 session token request.
+        assert len(request.call_args_list) == 2
+        # A Fargate task cannot route to the EC2 instance metadata server.
+        for call_kwargs in [call[1] for call in request.call_args_list]:
+            assert "169.254.169.254" not in call_kwargs["url"]
+
+    @mock.patch("google.auth._helpers.utcnow")
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_ecs_container_credentials_with_env_region(
+        self, utcnow
+    ):
+        """With the region in the environment, the container credential provider
+        is the only endpoint contacted."""
+        utcnow.return_value = datetime.datetime.strptime(
+            self.AWS_SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
+        )
+        request = self.make_mock_request_sequence(
+            (
+                http_client.OK,
+                json.dumps(self.AWS_SECURITY_CREDENTIALS_RESPONSE).encode("utf-8"),
+            )
+        )
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        subject_token = credentials.retrieve_subject_token(request)
+
+        assert subject_token == self.make_serialized_aws_signed_request(
+            aws.AwsSecurityCredentials(ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN)
+        )
+        self.assert_aws_metadata_request_kwargs(
+            request.call_args_list[0][1],
+            ECS_CREDENTIALS_URL,
+            {"Content-Type": "application/json"},
+        )
+        assert len(request.call_args_list) == 1
+
+    @mock.patch("google.auth._helpers.utcnow")
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+            "AWS_ACCESS_KEY_ID": ACCESS_KEY_ID,
+            "AWS_SECRET_ACCESS_KEY": SECRET_ACCESS_KEY,
+            "AWS_SESSION_TOKEN": TOKEN,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_env_credentials_precede_container_provider(
+        self, utcnow
+    ):
+        """Credentials in the environment still win over the container provider."""
+        utcnow.return_value = datetime.datetime.strptime(
+            self.AWS_SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
+        )
+        request = self.make_mock_request_sequence()
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        subject_token = credentials.retrieve_subject_token(request)
+
+        assert subject_token == self.make_serialized_aws_signed_request(
+            aws.AwsSecurityCredentials(ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN)
+        )
+        assert len(request.call_args_list) == 0
+
+    @mock.patch("google.auth._helpers.utcnow")
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI,
+            "AWS_EXECUTION_ENV": "AWS_ECS_FARGATE",
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_ecs_task_metadata_alone_keeps_role_name_lookup(
+        self, utcnow
+    ):
+        """The ECS task metadata variables are injected on the EC2 launch type as
+        well, and AWS_EXECUTION_ENV describes the launch type, not which
+        credential endpoint exists. Without a container credential provider in
+        the environment, credentials must still be read from the EC2 instance
+        metadata server, role name and all."""
+        utcnow.return_value = datetime.datetime.strptime(
+            self.AWS_SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
+        )
+        request = self.make_mock_request_sequence(
+            (http_client.OK, self.AWS_ROLE.encode("utf-8")),
+            (
+                http_client.OK,
+                json.dumps(self.AWS_SECURITY_CREDENTIALS_RESPONSE).encode("utf-8"),
+            ),
+        )
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        subject_token = credentials.retrieve_subject_token(request)
+
+        assert subject_token == self.make_serialized_aws_signed_request(
+            aws.AwsSecurityCredentials(ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN)
+        )
+        # Assert role name request.
+        self.assert_aws_metadata_request_kwargs(
+            request.call_args_list[0][1], SECURITY_CREDS_URL
+        )
+        # Assert security credentials request, with the role name appended.
+        self.assert_aws_metadata_request_kwargs(
+            request.call_args_list[1][1],
+            "{}/{}".format(SECURITY_CREDS_URL, self.AWS_ROLE),
+            {"Content-Type": "application/json"},
+        )
+        assert len(request.call_args_list) == 2
+
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_error_no_url_in_ecs_environment(self):
+        """A credential source without a url is rejected before any request is
+        made, on an ECS host as anywhere else."""
+        credential_source = self.CREDENTIAL_SOURCE.copy()
+        credential_source.pop("url")
+        request = self.make_mock_request_sequence()
+        credentials = self.make_credentials(credential_source=credential_source)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(
+            r"Unable to determine the AWS metadata server security credentials endpoint"
+        )
+        assert len(request.call_args_list) == 0
+
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_error_container_provider(self):
+        request = self.make_mock_request_sequence(
+            (http_client.BAD_REQUEST, b"unable to assume role")
+        )
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(r"Unable to retrieve AWS security credentials")
+
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_error_container_provider_omits_body(self):
+        """A non-200 response body is not echoed into the error, which reaches
+        logs: an error response cut off mid-credentials-document could still
+        carry a secret access key. The status code is kept for diagnosis."""
+        body = json.dumps(self.AWS_SECURITY_CREDENTIALS_RESPONSE)[:-1].encode("utf-8")
+        request = self.make_mock_request_sequence(
+            (http_client.INTERNAL_SERVER_ERROR, body)
+        )
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(r"Unable to retrieve AWS security credentials")
+        assert "500" in str(excinfo.value)
+        assert SECRET_ACCESS_KEY not in str(excinfo.value)
+        assert TOKEN not in str(excinfo.value)
+
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    def test_retrieve_subject_token_error_container_provider_non_json(self):
+        """A 200 response that is not a credentials document fails as a
+        RefreshError like every other credential retrieval failure, rather than
+        letting a JSON decoding error escape refresh."""
+        request = self.make_mock_request_sequence(
+            (http_client.OK, b"<html>not a credentials document</html>")
+        )
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(
+            r"Unable to parse the AWS security credentials returned by the "
+            r"ECS container credential provider"
+        )
+        # The response body is not echoed: a credentials document truncated in
+        # transit fails to parse and still carries a secret access key.
+        assert "not a credentials document" not in str(excinfo.value)
+
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # Truncated in transit: json.JSONDecodeError.doc holds it whole.
+            json.dumps(AWS_SECURITY_CREDENTIALS_RESPONSE)[:-1].encode("utf-8"),
+            # Not UTF-8: UnicodeDecodeError.object holds it whole.
+            b"\xff" + json.dumps(AWS_SECURITY_CREDENTIALS_RESPONSE).encode("utf-8"),
+        ],
+    )
+    def test_retrieve_subject_token_error_container_provider_parse_not_chained(
+        self, body
+    ):
+        """The decoding error is neither chained nor left as the context of the
+        RefreshError: both exception types keep the complete response body as
+        an attribute, and anything that walks or serializes the chain would
+        carry the secret access key out with it."""
+        request = self.make_mock_request_sequence((http_client.OK, body))
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert SECRET_ACCESS_KEY not in str(excinfo.value)
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
+
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    @pytest.mark.parametrize("body", [b"[]", b"null", b'"credentials"', b"42"])
+    def test_retrieve_subject_token_error_container_provider_not_an_object(
+        self, body
+    ):
+        """A 200 response that parses as JSON but is not an object is not a
+        credentials document either, and fails as a RefreshError rather than an
+        AttributeError when its fields are read."""
+        request = self.make_mock_request_sequence((http_client.OK, body))
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(
+            r"Unable to parse the AWS security credentials returned by the "
+            r"ECS container credential provider"
+        )
+
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    @pytest.mark.parametrize(
+        "status, message",
+        [
+            (
+                http_client.OK,
+                r"Unable to parse the AWS security credentials returned by the "
+                r"ECS container credential provider",
+            ),
+            (http_client.INTERNAL_SERVER_ERROR, r"HTTP 500"),
+        ],
+    )
+    def test_retrieve_subject_token_error_container_provider_not_utf8(
+        self, status, message
+    ):
+        """A body that does not decode as UTF-8 fails as a RefreshError, on the
+        error branch as well as the success branch, rather than escaping as a
+        UnicodeDecodeError -- whose ``object`` is the whole response body."""
+        body = b'\xff\xfe{"SecretAccessKey": "' + SECRET_ACCESS_KEY.encode("utf-8")
+        request = self.make_mock_request_sequence((status, body))
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(message)
+        assert SECRET_ACCESS_KEY not in str(excinfo.value)
+
+    @mock.patch.dict(
+        os.environ,
+        {"AWS_REGION": AWS_REGION, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ""},
+        clear=True,
+    )
+    def test_retrieve_subject_token_error_empty_container_credentials_path(self):
+        """A present but empty credential path is a broken ECS task environment,
+        not the absence of one. Falling through to the EC2 instance metadata
+        server would sign with the host's instance role on the EC2 launch type
+        rather than the task role, so it fails closed instead -- as botocore's
+        container provider does, which keys off the variable's presence."""
+        request = self.make_mock_request_sequence()
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(r"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI is empty")
+        assert len(request.call_args_list) == 0
+
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_get_container_credentials_url_without_ecs_environment(self):
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+
+        assert supplier._get_container_credentials_url() is None
+
+    @mock.patch.dict(
+        os.environ,
+        {"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "http://metadata.example.com/creds"},
+        clear=True,
+    )
+    def test_get_container_credentials_url_stays_on_the_link_local_host(self):
+        """The credential path comes from the environment, so a value shaped like
+        a full URL must not redirect the credential request off the host."""
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+
+        url = supplier._get_container_credentials_url()
+
+        assert urllib.parse.urlsplit(url).hostname == "169.254.170.2"
+
+    @mock.patch.dict(
+        os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI},
+        clear=True,
+    )
+    def test_get_aws_region_from_ecs_task_metadata(self):
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (
+                http_client.OK,
+                json.dumps(self.ECS_TASK_METADATA_RESPONSE).encode("utf-8"),
+            )
+        )
+
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        self.assert_aws_metadata_request_kwargs(
+            request.call_args_list[0][1], ECS_TASK_METADATA_URL
+        )
+        assert len(request.call_args_list) == 1
+
+    @mock.patch.dict(
+        os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI},
+        clear=True,
+    )
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b"internal error",
+            # An error body that is not UTF-8 is not decoded at all.
+            b"\xff\xfeinternal error",
+        ],
+    )
+    def test_get_aws_region_falls_back_to_metadata_server_on_ecs_error(self, body):
+        """The task metadata lookup is best effort: the EC2 instance metadata
+        server stays the fallback for workloads that can reach it."""
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (http_client.INTERNAL_SERVER_ERROR, body),
+            (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8")),
+        )
+
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        assert [call[1]["url"] for call in request.call_args_list] == [
+            ECS_TASK_METADATA_URL,
+            REGION_URL,
+        ]
+
+    @mock.patch.dict(
+        os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI},
+        clear=True,
+    )
+    def test_get_aws_region_falls_back_when_task_metadata_has_no_arn(self):
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (http_client.OK, json.dumps({"Cluster": "default"}).encode("utf-8")),
+            (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8")),
+        )
+
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        assert [call[1]["url"] for call in request.call_args_list] == [
+            ECS_TASK_METADATA_URL,
+            REGION_URL,
+        ]
+
+    @mock.patch.dict(
+        os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": ECS_CONTAINER_METADATA_URI},
+        clear=True,
+    )
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # Not JSON at all.
+            b"<html>not task metadata</html>",
+            # JSON, but not a task metadata object.
+            b"[]",
+            # Not UTF-8, so not even text.
+            b'\xff\xfe{"TaskARN": "arn:aws:ecs:us-east-2:123456789012:task/x"}',
+            # A task metadata object whose ARN is not a string.
+            b'{"TaskARN": 42}',
+        ],
+    )
+    def test_get_aws_region_falls_back_when_task_metadata_is_not_json(self, body):
+        """A 200 response that is not a task metadata document falls back to the
+        EC2 instance metadata server rather than letting a decoding error
+        escape refresh."""
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (http_client.OK, body),
+            (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8")),
+        )
+
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        assert [call[1]["url"] for call in request.call_args_list] == [
+            ECS_TASK_METADATA_URL,
+            REGION_URL,
+        ]
+
+    @mock.patch.dict(
+        os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": "http://127.0.0.1:8080/v4"},
+        clear=True,
+    )
+    def test_get_aws_region_ignores_loopback_task_metadata_uri(self):
+        """No AWS metadata endpoint lives on loopback, so a task metadata URI
+        pointing there is a spoofed value rather than a metadata endpoint and
+        must not be contacted."""
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8"))
+        )
+
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        assert [call[1]["url"] for call in request.call_args_list] == [REGION_URL]
+
+    @mock.patch.dict(
+        os.environ,
+        {"ECS_CONTAINER_METADATA_URI_V4": "http://metadata.example.com/v4/task"},
+        clear=True,
+    )
+    def test_get_aws_region_ignores_non_link_local_task_metadata_uri(self):
+        """The task metadata URI comes from the environment; only the link-local
+        metadata endpoint is ever contacted."""
+        supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)
+        request = self.make_mock_request_sequence(
+            (http_client.OK, "{}b".format(self.AWS_REGION).encode("utf-8"))
+        )
+
+        assert supplier.get_aws_region(None, request) == self.AWS_REGION
+        assert [call[1]["url"] for call in request.call_args_list] == [REGION_URL]
 
     def test_retrieve_subject_token_error_with_supplier(self):
         request = self.make_mock_request()
