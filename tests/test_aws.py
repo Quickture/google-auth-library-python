@@ -2580,6 +2580,26 @@ class TestCredentials(object):
         # transit fails to parse and still carries a secret access key.
         assert "not a credentials document" not in str(excinfo.value)
 
+    @mock.patch.dict(
+        os.environ,
+        {"AWS_REGION": AWS_REGION, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ""},
+        clear=True,
+    )
+    def test_retrieve_subject_token_error_empty_container_credentials_path(self):
+        """A present but empty credential path is a broken ECS task environment,
+        not the absence of one. Falling through to the EC2 instance metadata
+        server would sign with the host's instance role on the EC2 launch type
+        rather than the task role, so it fails closed instead -- as botocore's
+        container provider does, which keys off the variable's presence."""
+        request = self.make_mock_request_sequence()
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(r"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI is empty")
+        assert len(request.call_args_list) == 0
+
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_get_container_credentials_url_without_ecs_environment(self):
         supplier = aws._DefaultAwsSecurityCredentialsSupplier(self.CREDENTIAL_SOURCE)

@@ -640,10 +640,27 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
         Returns:
             Optional[str]: The ECS container credential provider URL, or None if
                 the current environment does not expose one.
+
+        Raises:
+            google.auth.exceptions.RefreshError: If the credential path variable
+                is set but empty.
         """
         relative_uri = os.environ.get(_ECS_CONTAINER_CREDENTIALS_RELATIVE_URI_ENV)
-        if not relative_uri:
+        if relative_uri is None:
             return None
+
+        # Present but empty is a broken task environment, not the absence of
+        # one. Falling through to the EC2 instance metadata server would sign
+        # with the host's instance role on the EC2 launch type instead of the
+        # task role, so fail closed. botocore's container provider likewise
+        # keys off the variable's presence and never falls back.
+        if not relative_uri:
+            raise exceptions.RefreshError(
+                "Unable to determine the ECS container credential provider "
+                "endpoint: {} is empty".format(
+                    _ECS_CONTAINER_CREDENTIALS_RELATIVE_URI_ENV
+                )
+            )
 
         # The path comes from the environment, so it is appended to the
         # link-local host rather than joined as a URL: that keeps the request
