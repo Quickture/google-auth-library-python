@@ -2560,6 +2560,32 @@ class TestCredentials(object):
         },
         clear=True,
     )
+    def test_retrieve_subject_token_error_container_provider_omits_body(self):
+        """A non-200 response body is not echoed into the error, which reaches
+        logs: an error response cut off mid-credentials-document could still
+        carry a secret access key. The status code is kept for diagnosis."""
+        body = json.dumps(self.AWS_SECURITY_CREDENTIALS_RESPONSE)[:-1].encode("utf-8")
+        request = self.make_mock_request_sequence(
+            (http_client.INTERNAL_SERVER_ERROR, body)
+        )
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(r"Unable to retrieve AWS security credentials")
+        assert "500" in str(excinfo.value)
+        assert SECRET_ACCESS_KEY not in str(excinfo.value)
+        assert TOKEN not in str(excinfo.value)
+
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
     def test_retrieve_subject_token_error_container_provider_non_json(self):
         """A 200 response that is not a credentials document fails as a
         RefreshError like every other credential retrieval failure, rather than

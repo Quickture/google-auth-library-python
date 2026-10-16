@@ -698,17 +698,19 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
             else response.data
         )
 
+        # The body is deliberately left out of both messages below. It reaches
+        # logs, and a credentials document cut off in transit -- whether it
+        # arrives as an error or fails to parse -- still carries a secret
+        # access key.
         if response.status != http_client.OK:
             raise exceptions.RefreshError(
-                "Unable to retrieve AWS security credentials: {}".format(response_body)
+                "Unable to retrieve AWS security credentials from the ECS "
+                "container credential provider: HTTP {}".format(response.status)
             )
 
         try:
             return json.loads(response_body)
         except ValueError as caught_exc:
-            # The body is deliberately left out of the message: a credentials
-            # document truncated in transit fails to parse and still carries a
-            # secret access key.
             new_exc = exceptions.RefreshError(
                 "Unable to parse the AWS security credentials returned by the "
                 "ECS container credential provider"
