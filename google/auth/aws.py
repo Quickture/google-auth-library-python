@@ -691,17 +691,11 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
             url=url, method="GET", headers={"Content-Type": "application/json"}
         )
 
-        # support both string and bytes type response.data
-        response_body = (
-            response.data.decode("utf-8")
-            if hasattr(response.data, "decode")
-            else response.data
-        )
-
         # The body is deliberately left out of both messages below. It reaches
         # logs, and a credentials document cut off in transit -- whether it
         # arrives as an error or fails to parse -- still carries a secret
-        # access key.
+        # access key. The status is checked before the body is decoded, so an
+        # error response is never decoded at all.
         if response.status != http_client.OK:
             raise exceptions.RefreshError(
                 "Unable to retrieve AWS security credentials from the ECS "
@@ -713,6 +707,13 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
             "ECS container credential provider"
         )
         try:
+            # support both string and bytes type response.data. Decoding is
+            # inside the boundary: UnicodeDecodeError is a ValueError.
+            response_body = (
+                response.data.decode("utf-8")
+                if hasattr(response.data, "decode")
+                else response.data
+            )
             credentials = json.loads(response_body)
         except ValueError as caught_exc:
             new_exc = exceptions.RefreshError(parse_error)
