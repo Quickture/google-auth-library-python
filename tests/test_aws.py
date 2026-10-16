@@ -2614,6 +2614,40 @@ class TestCredentials(object):
         },
         clear=True,
     )
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # Truncated in transit: json.JSONDecodeError.doc holds it whole.
+            json.dumps(AWS_SECURITY_CREDENTIALS_RESPONSE)[:-1].encode("utf-8"),
+            # Not UTF-8: UnicodeDecodeError.object holds it whole.
+            b"\xff" + json.dumps(AWS_SECURITY_CREDENTIALS_RESPONSE).encode("utf-8"),
+        ],
+    )
+    def test_retrieve_subject_token_error_container_provider_parse_not_chained(
+        self, body
+    ):
+        """The decoding error is neither chained nor left as the context of the
+        RefreshError: both exception types keep the complete response body as
+        an attribute, and anything that walks or serializes the chain would
+        carry the secret access key out with it."""
+        request = self.make_mock_request_sequence((http_client.OK, body))
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert SECRET_ACCESS_KEY not in str(excinfo.value)
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
+
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
     @pytest.mark.parametrize("body", [b"[]", b"null", b'"credentials"', b"42"])
     def test_retrieve_subject_token_error_container_provider_not_an_object(
         self, body

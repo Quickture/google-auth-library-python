@@ -702,10 +702,6 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
                 "container credential provider: HTTP {}".format(response.status)
             )
 
-        parse_error = (
-            "Unable to parse the AWS security credentials returned by the "
-            "ECS container credential provider"
-        )
         try:
             # support both string and bytes type response.data. Decoding is
             # inside the boundary: UnicodeDecodeError is a ValueError.
@@ -715,14 +711,20 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
                 else response.data
             )
             credentials = json.loads(response_body)
-        except ValueError as caught_exc:
-            new_exc = exceptions.RefreshError(parse_error)
-            raise new_exc from caught_exc
+        except ValueError:
+            # Not raised from here, not even "from None": JSONDecodeError.doc
+            # and UnicodeDecodeError.object hold the whole body, and an
+            # exception raised inside this block would keep that reachable as
+            # its __cause__ or __context__.
+            credentials = None
 
         # Valid JSON that is not an object ([], null) is not a credentials
         # document either, and would otherwise fail later as an AttributeError.
         if not isinstance(credentials, dict):
-            raise exceptions.RefreshError(parse_error)
+            raise exceptions.RefreshError(
+                "Unable to parse the AWS security credentials returned by the "
+                "ECS container credential provider"
+            )
 
         return credentials
 
