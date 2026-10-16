@@ -2608,6 +2608,32 @@ class TestCredentials(object):
 
     @mock.patch.dict(
         os.environ,
+        {
+            "AWS_REGION": AWS_REGION,
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ECS_CREDENTIALS_RELATIVE_URI,
+        },
+        clear=True,
+    )
+    @pytest.mark.parametrize("body", [b"[]", b"null", b'"credentials"', b"42"])
+    def test_retrieve_subject_token_error_container_provider_not_an_object(
+        self, body
+    ):
+        """A 200 response that parses as JSON but is not an object is not a
+        credentials document either, and fails as a RefreshError rather than an
+        AttributeError when its fields are read."""
+        request = self.make_mock_request_sequence((http_client.OK, body))
+        credentials = self.make_credentials(credential_source=self.CREDENTIAL_SOURCE)
+
+        with pytest.raises(exceptions.RefreshError) as excinfo:
+            credentials.retrieve_subject_token(request)
+
+        assert excinfo.match(
+            r"Unable to parse the AWS security credentials returned by the "
+            r"ECS container credential provider"
+        )
+
+    @mock.patch.dict(
+        os.environ,
         {"AWS_REGION": AWS_REGION, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": ""},
         clear=True,
     )

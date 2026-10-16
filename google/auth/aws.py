@@ -708,14 +708,22 @@ class _DefaultAwsSecurityCredentialsSupplier(AwsSecurityCredentialsSupplier):
                 "container credential provider: HTTP {}".format(response.status)
             )
 
+        parse_error = (
+            "Unable to parse the AWS security credentials returned by the "
+            "ECS container credential provider"
+        )
         try:
-            return json.loads(response_body)
+            credentials = json.loads(response_body)
         except ValueError as caught_exc:
-            new_exc = exceptions.RefreshError(
-                "Unable to parse the AWS security credentials returned by the "
-                "ECS container credential provider"
-            )
+            new_exc = exceptions.RefreshError(parse_error)
             raise new_exc from caught_exc
+
+        # Valid JSON that is not an object ([], null) is not a credentials
+        # document either, and would otherwise fail later as an AttributeError.
+        if not isinstance(credentials, dict):
+            raise exceptions.RefreshError(parse_error)
+
+        return credentials
 
     def _get_ecs_task_region(self, request):
         """Best effort lookup of the AWS region from the ECS task metadata
